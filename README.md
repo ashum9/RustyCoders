@@ -2,7 +2,11 @@
 
 Code Repository for RustyCoders
 
-## Architecture Overview
+## MVP Architecture
+
+![MVP Architecture](assets/mvp.png)
+
+## High Level Architecture
 
 This project implements a **Layer-4 TCP Traffic Gateway** in **Rust + Tokio**, acting as an intermediary between clients and backend servers. The gateway accepts incoming TCP connections, selects a healthy backend using configurable load-balancing strategies, and forwards raw bytes bidirectionally without inspecting application-layer data.
 
