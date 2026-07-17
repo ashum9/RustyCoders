@@ -13,7 +13,7 @@ This project implements a **Layer-4 TCP Traffic Gateway** in **Rust + Tokio**, a
 - **TCP Listener** – Accepts incoming client connections and spawns an async task for each connection.
 - **Load Balancer** – Selects a backend using **Round Robin** or **Least Connections**, considering only healthy servers.
 - **Proxy Engine** – Establishes backend connections and performs raw-byte TCP forwarding with retry/failover support.
-- **Health Checker** – Continuously monitors backend availability using active probes and passive failure detection.
+- **Health Checker** - Continuously monitors backend availability using active probes and passive failure detection.
 - **Backend Pool** – Maintains backend metadata such as health status, active connections, and routing eligibility.
 - **Metrics & Dashboard** – Provides observability through connection statistics, backend health, traffic metrics, and system events.
 - **TOML Configuration** – Controls gateway behavior, backend definitions, thresholds, and load-balancing settings without code changes.
