@@ -1,3 +1,4 @@
+use crate::backend::instance::ConnectionGuard;
 use crate::metrics::Metrics;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ pub struct Connection {
     client_addr: SocketAddr,
     listener_name: String,
     metrics: Arc<Metrics>,
+    _guard: ConnectionGuard,
 }
 
 impl Connection {
@@ -21,6 +23,7 @@ impl Connection {
         client_addr: SocketAddr,
         listener_name: String,
         metrics: Arc<Metrics>,
+        guard: ConnectionGuard,
     ) -> Self {
         Self {
             client,
@@ -28,6 +31,7 @@ impl Connection {
             client_addr,
             listener_name,
             metrics,
+            _guard: guard,
         }
     }
 

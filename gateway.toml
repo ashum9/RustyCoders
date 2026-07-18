@@ -4,9 +4,18 @@ max_connections = 1024
 [[listeners]]
 name = "service-a"
 listen = "127.0.0.1:8081"
-backend = "127.0.0.1:9001"
+backends = [
+    "127.0.0.1:9001",
+    "127.0.0.1:9002",
+    "127.0.0.1:9003"
+]
+strategy = "round_robin"
 
 [[listeners]]
 name = "service-b"
 listen = "127.0.0.1:8082"
-backend = "127.0.0.1:9002"
+backends = [
+    "127.0.0.1:9010",
+    "127.0.0.1:9011"
+]
+strategy = "least_connections"

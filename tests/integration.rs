@@ -7,6 +7,9 @@ use traffic_gateway::config::ListenerConfig;
 use traffic_gateway::listener::run_listener;
 use traffic_gateway::metrics::Metrics;
 
+use traffic_gateway::backend::instance::BackendInstance;
+use traffic_gateway::backend::pool::{BackendPool, LbStrategy};
+
 async fn spawn_gateway_listener(backend_port: u16) -> (u16, CancellationToken) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listen_port = listener.local_addr().unwrap().port();
@@ -14,15 +17,22 @@ async fn spawn_gateway_listener(backend_port: u16) -> (u16, CancellationToken) {
     let config = ListenerConfig {
         name: format!("test-{}", listen_port),
         listen: format!("127.0.0.1:{}", listen_port),
-        backend: format!("127.0.0.1:{}", backend_port),
+        backends: vec![format!("127.0.0.1:{}", backend_port)],
+        strategy: "round_robin".to_string(),
+        connect_timeout_ms: 1000,
+        health_check: Default::default(),
     };
+    
+    let instance = Arc::new(BackendInstance::new(format!("127.0.0.1:{}", backend_port).parse().unwrap()));
+    let pool = Arc::new(BackendPool::new(config.name.clone(), vec![instance], LbStrategy::RoundRobin));
+
     let metrics = Arc::new(Metrics::new());
     let semaphore = Arc::new(Semaphore::new(1024));
     let cancel_token = CancellationToken::new();
     let cancel_token_clone = cancel_token.clone();
 
     tokio::spawn(async move {
-        let _ = run_listener(listener, config, metrics, semaphore, cancel_token_clone).await;
+        let _ = run_listener(listener, pool, config.connect_timeout_ms, metrics, semaphore, cancel_token_clone).await;
     });
 
     (listen_port, cancel_token)
