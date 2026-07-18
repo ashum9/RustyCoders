@@ -61,10 +61,12 @@ impl Connection {
             Ok(Ok(b)) => b,
             Ok(Err(e)) => {
                 debug!("error copying from client to backend: {}", e);
+                metrics.inc_error();
                 0
             }
             Err(e) => {
                 error!("task c2b panicked or was cancelled: {}", e);
+                metrics.inc_error();
                 0
             }
         };
@@ -73,15 +75,17 @@ impl Connection {
             Ok(Ok(b)) => b,
             Ok(Err(e)) => {
                 debug!("error copying from backend to client: {}", e);
+                metrics.inc_error();
                 0
             }
             Err(e) => {
                 error!("task b2c panicked or was cancelled: {}", e);
+                metrics.inc_error();
                 0
             }
         };
 
-        metrics.add_bytes(client_to_backend_bytes + backend_to_client_bytes);
+        metrics.add_bytes(client_to_backend_bytes, backend_to_client_bytes);
 
         let duration = start_time.elapsed();
 
