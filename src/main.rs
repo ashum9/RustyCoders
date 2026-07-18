@@ -31,14 +31,40 @@ async fn main() -> anyhow::Result<()> {
     let metrics_clone = metrics.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let start_time = std::time::Instant::now();
+        let mut last_tick = std::time::Instant::now();
+        let mut last_total = 0;
+        let mut last_rx = 0;
+        let mut last_tx = 0;
+
         loop {
             interval.tick().await;
+            let now = std::time::Instant::now();
+            let elapsed_secs = (now - last_tick).as_secs().max(1);
+            let uptime_secs = (now - start_time).as_secs();
+
             let active = metrics_clone.active_connections.load(Ordering::Relaxed);
             let total = metrics_clone.total_connections.load(Ordering::Relaxed);
-            let bytes = metrics_clone.bytes_forwarded.load(Ordering::Relaxed);
+            let peak = metrics_clone.peak_active_connections.load(Ordering::Relaxed);
+            let errors = metrics_clone.connection_errors.load(Ordering::Relaxed);
+            let bytes_rx = metrics_clone.bytes_rx.load(Ordering::Relaxed);
+            let bytes_tx = metrics_clone.bytes_tx.load(Ordering::Relaxed);
+            
+            let total_latency_us = metrics_clone.backend_connect_latency_us.load(Ordering::Relaxed);
+            let avg_latency = if total > 0 { total_latency_us / total } else { 0 };
+
+            let cps = (total.saturating_sub(last_total)) / elapsed_secs;
+            let rx_rate = (bytes_rx.saturating_sub(last_rx)) / elapsed_secs;
+            let tx_rate = (bytes_tx.saturating_sub(last_tx)) / elapsed_secs;
+
+            last_tick = now;
+            last_total = total;
+            last_rx = bytes_rx;
+            last_tx = bytes_tx;
+
             tracing::info!(
-                "metrics: active_connections={}, total_connections={}, total_bytes_forwarded={}",
-                active, total, bytes
+                "metrics [UP {}s]: active={}, peak={}, total={}, CPS={}/s, rx_total={}B ({} B/s), tx_total={}B ({} B/s), latency={}µs, errors={}",
+                uptime_secs, active, peak, total, cps, bytes_rx, rx_rate, bytes_tx, tx_rate, avg_latency, errors
             );
         }
     });

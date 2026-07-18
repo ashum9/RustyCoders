@@ -52,22 +52,26 @@ pub async fn run_listener(
                         tokio::spawn(async move {
                             let _permit = permit;
                             
+                            let start = std::time::Instant::now();
                             match TcpStream::connect(&backend_addr_owned).await {
                                 Ok(backend_stream) => {
+                                    metrics_clone.add_latency(start.elapsed().as_micros() as u64);
                                     let connection = Connection::new(
                                         client_stream,
                                         backend_stream,
                                         client_addr,
                                         listener_name,
-                                        metrics_clone,
+                                        metrics_clone.clone(),
                                     );
 
                                     if let Err(e) = connection.process().await {
                                         warn!(peer = %client_addr, error = %e, "connection ended with error");
+                                        metrics_clone.inc_error();
                                     }
                                 }
                                 Err(e) => {
                                     error!("failed to connect to backend {}: {}", backend_addr_owned, e);
+                                    metrics_clone.inc_error();
                                 }
                             }
                         });
