@@ -11,6 +11,7 @@ pub struct Connection {
     client: TcpStream,
     backend: TcpStream,
     client_addr: SocketAddr,
+    backend_addr: SocketAddr,
     listener_name: String,
     metrics: Arc<Metrics>,
     _guard: ConnectionGuard,
@@ -21,6 +22,7 @@ impl Connection {
         client: TcpStream,
         backend: TcpStream,
         client_addr: SocketAddr,
+        backend_addr: SocketAddr,
         listener_name: String,
         metrics: Arc<Metrics>,
         guard: ConnectionGuard,
@@ -29,6 +31,7 @@ impl Connection {
             client,
             backend,
             client_addr,
+            backend_addr,
             listener_name,
             metrics,
             _guard: guard,
@@ -94,8 +97,8 @@ impl Connection {
         let duration = start_time.elapsed();
 
         info!(
-            "[{}] connection closed. peer: {}, client->backend: {} bytes, backend->client: {} bytes, duration: {:?}",
-            self.listener_name, client_addr, client_to_backend_bytes, backend_to_client_bytes, duration
+            "[{}] connection closed. peer: {}, backend: {}, client->backend: {} bytes, backend->client: {} bytes, duration: {:?}",
+            self.listener_name, client_addr, self.backend_addr, client_to_backend_bytes, backend_to_client_bytes, duration
         );
 
         Ok(())

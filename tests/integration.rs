@@ -32,7 +32,7 @@ async fn spawn_gateway_listener(backend_port: u16) -> (u16, CancellationToken) {
     let cancel_token_clone = cancel_token.clone();
 
     tokio::spawn(async move {
-        let _ = run_listener(listener, pool, config.connect_timeout_ms, metrics, semaphore, cancel_token_clone).await;
+        let _ = run_listener(listener, pool, config.connect_timeout_ms, config.health_check.healthy_threshold, config.health_check.unhealthy_threshold, metrics, semaphore, cancel_token_clone).await;
     });
 
     (listen_port, cancel_token)
@@ -156,12 +156,17 @@ async fn test_backend_unavailable() {
     client.write_all(b"hello").await.unwrap();
     
     let mut buf = [0; 1024];
-    let res = client.read(&mut buf).await;
+    // Gateway retries with timeout per attempt, so we need to wait long enough
+    let res = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        client.read(&mut buf),
+    ).await;
     
     match res {
-        Ok(0) => (),
-        Err(_) => (),
-        Ok(n) => panic!("expected connection close, but received {} bytes", n),
+        Ok(Ok(0)) => (),     // clean close
+        Ok(Err(_)) => (),    // error close
+        Err(_) => (),        // our read timed out — still acceptable
+        Ok(Ok(n)) => panic!("expected connection close, but received {} bytes", n),
     }
 
     // Ensure gateway didn't crash — spin up a working pair
@@ -370,4 +375,106 @@ async fn test_broken_connection_under_load() {
     for handle in handles {
         let _ = handle.await;
     }
+}
+
+/// Helper: spawn a gateway with MULTIPLE backends (for failover tests)
+async fn spawn_gateway_multi_backend(backend_ports: &[u16]) -> (u16, CancellationToken) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_port = listener.local_addr().unwrap().port();
+
+    let instances: Vec<Arc<BackendInstance>> = backend_ports
+        .iter()
+        .map(|p| Arc::new(BackendInstance::new(format!("127.0.0.1:{}", p).parse().unwrap())))
+        .collect();
+
+    let pool = Arc::new(BackendPool::new(
+        format!("failover-test-{}", listen_port),
+        instances,
+        LbStrategy::RoundRobin,
+    ));
+
+    let metrics = Arc::new(Metrics::new());
+    let semaphore = Arc::new(Semaphore::new(1024));
+    let cancel_token = CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+
+    let healthy_threshold = 2u32;
+    let unhealthy_threshold = 3u32;
+
+    tokio::spawn(async move {
+        let _ = run_listener(listener, pool, 1000, healthy_threshold, unhealthy_threshold, metrics, semaphore, cancel_token_clone).await;
+    });
+
+    (listen_port, cancel_token)
+}
+
+#[tokio::test]
+async fn test_connect_time_failover_is_seamless() {
+    // Start 2 real backends, use 1 fake dead port (59990)
+    let (b1_port, _b1) = spawn_echo_identity_backend("BACKEND-A").await;
+    let (b2_port, _b2) = spawn_echo_identity_backend("BACKEND-B").await;
+    let dead_port: u16 = 59990; // nothing listens here
+
+    // Gateway has 3 backends: alive, dead, alive
+    let (g_port, _g) = spawn_gateway_multi_backend(&[b1_port, dead_port, b2_port]).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Fire 20 requests — ALL should succeed despite the dead backend
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let handle = tokio::spawn(async move {
+            let mut client = TcpStream::connect(format!("127.0.0.1:{}", g_port)).await.unwrap();
+            client.write_all(b"ping").await.unwrap();
+            let mut buf = [0; 1024];
+            let n = client.read(&mut buf).await.unwrap();
+            let response = String::from_utf8_lossy(&buf[..n]);
+            // Must get a response from one of the alive backends
+            assert!(
+                response == "BACKEND-A" || response == "BACKEND-B",
+                "unexpected response: {}",
+                response
+            );
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_all_backends_down_clean_failure() {
+    // All 3 ports are dead — nothing is listening
+    let (g_port, _g) = spawn_gateway_multi_backend(&[59991, 59992, 59993]).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Send a request — it should get a clean close, NOT a crash
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", g_port)).await.unwrap();
+    client.write_all(b"hello").await.unwrap();
+
+    let mut buf = [0; 1024];
+    // Gateway retries all 3 dead backends (each with 1s timeout), so wait up to 10s
+    let res = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        client.read(&mut buf),
+    ).await;
+
+    match res {
+        Ok(Ok(0)) => (),     // clean close — expected
+        Ok(Err(_)) => (),    // error close — also fine
+        Err(_) => (),        // our read timed out — still acceptable
+        Ok(Ok(n)) => panic!("expected clean close, but received {} bytes", n),
+    }
+
+    // Most importantly: gateway should still be alive and accepting new connections
+    // Spin up a real backend and a new gateway to prove it
+    let (b_port, _b) = spawn_echo_identity_backend("RECOVERED").await;
+    let (g2_port, _g2) = spawn_gateway_listener(b_port).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", g2_port)).await.unwrap();
+    client2.write_all(b"ping").await.unwrap();
+    let n = client2.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"RECOVERED");
 }

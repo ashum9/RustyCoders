@@ -2,7 +2,7 @@ use traffic_gateway::backend::instance::BackendInstance;
 use traffic_gateway::backend::pool::{BackendPool, LbStrategy};
 use traffic_gateway::config::GatewayConfig;
 use traffic_gateway::metrics::Metrics;
-use std::str::FromStr;
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,11 +95,16 @@ async fn main() -> anyhow::Result<()> {
         let semaphore_clone = semaphore.clone();
         let cancel_token_clone = cancel_token.clone();
 
+        let healthy_threshold = listener.health_check.healthy_threshold;
+        let unhealthy_threshold = listener.health_check.unhealthy_threshold;
+
         tokio::spawn(async move {
             if let Err(e) = traffic_gateway::listener::run_server(
                 &listen_addr,
                 pool,
                 connect_timeout_ms,
+                healthy_threshold,
+                unhealthy_threshold,
                 metrics_clone,
                 semaphore_clone,
                 cancel_token_clone,

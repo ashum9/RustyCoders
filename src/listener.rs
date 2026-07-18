@@ -13,6 +13,8 @@ pub async fn run_server(
     listen_addr: &str,
     pool: Arc<BackendPool>,
     connect_timeout_ms: u64,
+    healthy_threshold: u32,
+    unhealthy_threshold: u32,
     metrics: Arc<Metrics>,
     semaphore: Arc<Semaphore>,
     cancel_token: CancellationToken,
@@ -22,13 +24,15 @@ pub async fn run_server(
     socket.bind(listen_addr.parse()?)?;
     let listener = socket.listen(1024)?;
     info!("[{}] listening on {} with {} backends", pool.name(), listen_addr, pool.instances().len());
-    run_listener(listener, pool, connect_timeout_ms, metrics, semaphore, cancel_token).await
+    run_listener(listener, pool, connect_timeout_ms, healthy_threshold, unhealthy_threshold, metrics, semaphore, cancel_token).await
 }
 
 pub async fn run_listener(
     listener: TcpListener,
     pool: Arc<BackendPool>,
     connect_timeout_ms: u64,
+    healthy_threshold: u32,
+    unhealthy_threshold: u32,
     metrics: Arc<Metrics>,
     semaphore: Arc<Semaphore>,
     cancel_token: CancellationToken,
@@ -56,46 +60,80 @@ pub async fn run_listener(
 
                         tokio::spawn(async move {
                             let _permit = permit;
-                            
-                            let instance = match pool_clone.select() {
-                                Some(inst) => inst,
-                                None => {
-                                    error!("[{}] no healthy backends available", pool_clone.name());
-                                    metrics_clone.inc_error();
-                                    return;
-                                }
-                            };
-
-                            let guard = ConnectionGuard::new(instance.clone());
                             let timeout_duration = Duration::from_millis(connect_timeout_ms);
-                            
-                            let start = std::time::Instant::now();
-                            match tokio::time::timeout(timeout_duration, TcpStream::connect(instance.address())).await {
-                                Ok(Ok(backend_stream)) => {
-                                    metrics_clone.add_latency(start.elapsed().as_micros() as u64);
-                                    let connection = Connection::new(
-                                        client_stream,
-                                        backend_stream,
-                                        client_addr,
-                                        listener_name,
-                                        metrics_clone.clone(),
-                                        guard,
-                                    );
+                            let max_retries = pool_clone.instances().len();
+                            let mut tried = std::collections::HashSet::new();
 
-                                    if let Err(e) = connection.process().await {
-                                        warn!(peer = %client_addr, error = %e, "connection ended with error");
+                            // --- Retry Loop: try different backends until one succeeds ---
+                            for attempt in 0..max_retries {
+                                let instance = match pool_clone.select() {
+                                    Some(inst) => inst,
+                                    None => {
+                                        // No healthy backends left at all
+                                        error!("[{}] no healthy backends available", pool_clone.name());
                                         metrics_clone.inc_error();
+                                        return;
+                                    }
+                                };
+
+                                // Skip if we already tried this exact address
+                                if !tried.insert(instance.address()) {
+                                    continue;
+                                }
+
+                                // RAII guard: created inside the loop, dropped automatically on failure
+                                let guard = ConnectionGuard::new(instance.clone());
+                                let start = std::time::Instant::now();
+
+                                match tokio::time::timeout(timeout_duration, TcpStream::connect(instance.address())).await {
+                                    Ok(Ok(backend_stream)) => {
+                                        // SUCCESS — record it, build the connection, and break out
+                                        instance.record_success(healthy_threshold);
+                                        metrics_clone.add_latency(start.elapsed().as_micros() as u64);
+                                        let backend_addr = backend_stream.peer_addr().unwrap_or_else(|_| instance.address());
+                                        let connection = Connection::new(
+                                            client_stream,
+                                            backend_stream,
+                                            client_addr,
+                                            backend_addr,
+                                            listener_name,
+                                            metrics_clone.clone(),
+                                            guard,
+                                        );
+
+                                        if let Err(e) = connection.process().await {
+                                            warn!(peer = %client_addr, error = %e, "connection ended with error");
+                                            metrics_clone.inc_error();
+                                        }
+                                        return; // Done — successfully proxied
+                                    }
+                                    Ok(Err(e)) => {
+                                        // Connection refused / error — mark failure and try next
+                                        instance.record_failure(unhealthy_threshold);
+                                        warn!(
+                                            "[{}] failover: {} failed (attempt {}/{}): {}, trying next backend",
+                                            pool_clone.name(), instance.address(), attempt + 1, max_retries, e
+                                        );
+                                        // guard is dropped here automatically (RAII), decrementing active count
+                                    }
+                                    Err(_) => {
+                                        // Timeout — mark failure and try next
+                                        instance.record_failure(unhealthy_threshold);
+                                        warn!(
+                                            "[{}] failover: {} timed out (attempt {}/{}), trying next backend",
+                                            pool_clone.name(), instance.address(), attempt + 1, max_retries
+                                        );
+                                        // guard is dropped here automatically (RAII)
                                     }
                                 }
-                                Ok(Err(e)) => {
-                                    error!("[{}] failed to connect to backend {}: {}", pool_clone.name(), instance.address(), e);
-                                    metrics_clone.inc_error();
-                                }
-                                Err(_) => {
-                                    error!("[{}] connection to backend {} timed out", pool_clone.name(), instance.address());
-                                    metrics_clone.inc_error();
-                                }
                             }
+
+                            // All retries exhausted — no backend could serve this client
+                            error!(
+                                "[{}] all {} backends failed for client {}, dropping connection",
+                                pool_clone.name(), max_retries, client_addr
+                            );
+                            metrics_clone.inc_error();
                         });
                     }
                     Err(e) => {

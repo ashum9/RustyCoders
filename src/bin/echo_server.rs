@@ -5,7 +5,11 @@ use tokio::net::TcpListener;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
-    let port = args.iter().position(|a| a == "--port").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| "9001".to_string());
+    let port = args.iter().position(|a| a == "--port")
+        .and_then(|i| args.get(i + 1))
+        .or_else(|| args.get(1)) // Fallback to the first argument passed
+        .cloned()
+        .unwrap_or_else(|| "9001".to_string());
 
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
