@@ -1,6 +1,8 @@
+use traffic_gateway::backend::instance::BackendInstance;
+use traffic_gateway::backend::pool::{BackendPool, LbStrategy};
 use traffic_gateway::config::GatewayConfig;
-use traffic_gateway::listener;
 use traffic_gateway::metrics::Metrics;
+use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,9 +22,6 @@ async fn main() -> anyhow::Result<()> {
     let config = GatewayConfig::load(config_path)?;
     
     tracing::info!("loaded config with {} listeners, max_connections: {}", config.listeners.len(), config.global.max_connections);
-    for listener in &config.listeners {
-        tracing::info!("  - [{}]: {} -> {}", listener.name, listener.listen, listener.backend);
-    }
 
     let metrics = Arc::new(Metrics::new());
     let semaphore = Arc::new(Semaphore::new(config.global.max_connections));
@@ -77,25 +76,42 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let mut listener_tasks = Vec::new();
+    for listener in config.listeners {
+        tracing::info!("  - [{}]: {} -> {:?}", listener.name, listener.listen, listener.backends);
 
-    for listener_config in config.listeners {
-        let metrics = metrics.clone();
-        let semaphore = semaphore.clone();
-        let cancel_token = cancel_token.clone();
+        let mut instances = Vec::new();
+        for addr_str in &listener.backends {
+            if let Ok(addr) = addr_str.parse() {
+                instances.push(Arc::new(BackendInstance::new(addr)));
+            }
+        }
         
-        let task = tokio::spawn(async move {
-            if let Err(e) = listener::run_server(listener_config, metrics, semaphore, cancel_token).await {
-                tracing::error!("server error: {}", e);
+        let strategy = LbStrategy::from_str(&listener.strategy).unwrap_or(LbStrategy::RoundRobin);
+        let pool = Arc::new(BackendPool::new(listener.name.clone(), instances, strategy));
+        let connect_timeout_ms = listener.connect_timeout_ms;
+        let listen_addr = listener.listen.clone();
+
+        let metrics_clone = metrics.clone();
+        let semaphore_clone = semaphore.clone();
+        let cancel_token_clone = cancel_token.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = traffic_gateway::listener::run_server(
+                &listen_addr,
+                pool,
+                connect_timeout_ms,
+                metrics_clone,
+                semaphore_clone,
+                cancel_token_clone,
+            )
+            .await
+            {
+                tracing::error!("listener {} failed: {}", listener.name, e);
             }
         });
-        listener_tasks.push(task);
     }
 
-    for task in listener_tasks {
-        let _ = task.await;
-    }
-
+    cancel_token.cancelled().await;
     tracing::info!("gateway shut down gracefully");
 
     Ok(())

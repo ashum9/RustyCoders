@@ -1,3 +1,4 @@
+use crate::backend::instance::ConnectionGuard;
 use crate::metrics::Metrics;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ pub struct Connection {
     client_addr: SocketAddr,
     listener_name: String,
     metrics: Arc<Metrics>,
+    _guard: ConnectionGuard,
 }
 
 impl Connection {
@@ -21,6 +23,7 @@ impl Connection {
         client_addr: SocketAddr,
         listener_name: String,
         metrics: Arc<Metrics>,
+        guard: ConnectionGuard,
     ) -> Self {
         Self {
             client,
@@ -28,6 +31,7 @@ impl Connection {
             client_addr,
             listener_name,
             metrics,
+            _guard: guard,
         }
     }
 
@@ -61,10 +65,12 @@ impl Connection {
             Ok(Ok(b)) => b,
             Ok(Err(e)) => {
                 debug!("error copying from client to backend: {}", e);
+                metrics.inc_error();
                 0
             }
             Err(e) => {
                 error!("task c2b panicked or was cancelled: {}", e);
+                metrics.inc_error();
                 0
             }
         };
@@ -73,15 +79,17 @@ impl Connection {
             Ok(Ok(b)) => b,
             Ok(Err(e)) => {
                 debug!("error copying from backend to client: {}", e);
+                metrics.inc_error();
                 0
             }
             Err(e) => {
                 error!("task b2c panicked or was cancelled: {}", e);
+                metrics.inc_error();
                 0
             }
         };
 
-        metrics.add_bytes(client_to_backend_bytes + backend_to_client_bytes);
+        metrics.add_bytes(client_to_backend_bytes, backend_to_client_bytes);
 
         let duration = start_time.elapsed();
 
