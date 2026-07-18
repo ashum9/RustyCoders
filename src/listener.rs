@@ -1,33 +1,84 @@
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{error, info};
+use crate::config::ListenerConfig;
+use crate::metrics::Metrics;
+use crate::proxy::connection::Connection;
+use std::sync::Arc;
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
-use crate::proxy;
-
-pub async fn run_single_connection_listener(
-    bind_addr: &str,
-    backend_addr: &str,
+pub async fn run_server(
+    config: ListenerConfig,
+    metrics: Arc<Metrics>,
+    semaphore: Arc<Semaphore>,
+    cancel_token: CancellationToken,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(bind_addr).await?;
-    info!("listening on {}", bind_addr);
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(config.listen.parse()?)?;
+    let listener = socket.listen(1024)?;
+    info!("[{}] listening on {} -> {}", config.name, config.listen, config.backend);
+    run_listener(listener, config, metrics, semaphore, cancel_token).await
+}
 
-    match listener.accept().await {
-        Ok((client_stream, client_addr)) => {
-            info!("accepted connection from client: {}", client_addr);
+pub async fn run_listener(
+    listener: TcpListener,
+    config: ListenerConfig,
+    metrics: Arc<Metrics>,
+    semaphore: Arc<Semaphore>,
+    cancel_token: CancellationToken,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                info!("[{}] listener shutting down", config.name);
+                break;
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((client_stream, client_addr)) => {
+                        let permit = match semaphore.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => {
+                                info!("[{}] semaphore closed, shutting down", config.name);
+                                break;
+                            }
+                        };
 
-            match TcpStream::connect(backend_addr).await {
-                Ok(backend_stream) => {
-                    info!("connected to backend at {}", backend_addr);
-                    proxy::forward(client_stream, backend_stream, client_addr).await;
-                }
-                Err(e) => {
-                    error!("failed to connect to backend {}: {}", backend_addr, e);
+                        let backend_addr_owned = config.backend.clone();
+                        let metrics_clone = metrics.clone();
+                        let listener_name = config.name.clone();
+
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            
+                            match TcpStream::connect(&backend_addr_owned).await {
+                                Ok(backend_stream) => {
+                                    let connection = Connection::new(
+                                        client_stream,
+                                        backend_stream,
+                                        client_addr,
+                                        listener_name,
+                                        metrics_clone,
+                                    );
+
+                                    if let Err(e) = connection.process().await {
+                                        warn!(peer = %client_addr, error = %e, "connection ended with error");
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("failed to connect to backend {}: {}", backend_addr_owned, e);
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("failed to accept client connection: {}", e);
+                    }
                 }
             }
         }
-        Err(e) => {
-            error!("failed to accept client connection: {}", e);
-        }
     }
-
+    
     Ok(())
 }
