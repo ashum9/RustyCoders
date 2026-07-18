@@ -1,8 +1,8 @@
 #!/bin/bash
 
 NUM_CLIENTS=${1:-100}
-TARGET_HOST=${2:-"127.0.0.1"}
-TARGET_PORT=${3:-8080}
+TARGET_PORT=${2:-8081}
+TARGET_HOST=${3:-"127.0.0.1"}
 
 echo "Starting $NUM_CLIENTS concurrent connections to $TARGET_HOST:$TARGET_PORT..."
 
