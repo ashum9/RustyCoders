@@ -7,6 +7,7 @@ use traffic_gateway::config::ListenerConfig;
 use traffic_gateway::listener::run_listener;
 use traffic_gateway::metrics::Metrics;
 
+use arc_swap::ArcSwap;
 use traffic_gateway::backend::instance::BackendInstance;
 use traffic_gateway::backend::pool::{BackendPool, LbStrategy};
 
@@ -24,7 +25,7 @@ async fn spawn_gateway_listener(backend_port: u16) -> (u16, CancellationToken) {
     };
     
     let instance = Arc::new(BackendInstance::new(format!("127.0.0.1:{}", backend_port).parse().unwrap(), "test_pool".into()));
-    let pool = Arc::new(BackendPool::new(config.name.clone(), vec![instance], LbStrategy::RoundRobin));
+    let pool = Arc::new(ArcSwap::from_pointee(BackendPool::new(config.name.clone(), vec![instance], LbStrategy::RoundRobin)));
 
     let metrics = Arc::new(Metrics::new());
     let semaphore = Arc::new(Semaphore::new(1024));
@@ -387,11 +388,11 @@ async fn spawn_gateway_multi_backend(backend_ports: &[u16]) -> (u16, Cancellatio
         .map(|p| Arc::new(BackendInstance::new(format!("127.0.0.1:{}", p).parse().unwrap(), "test_pool".into())))
         .collect();
 
-    let pool = Arc::new(BackendPool::new(
+    let pool = Arc::new(ArcSwap::from_pointee(BackendPool::new(
         format!("failover-test-{}", listen_port),
         instances,
         LbStrategy::RoundRobin,
-    ));
+    )));
 
     let metrics = Arc::new(Metrics::new());
     let semaphore = Arc::new(Semaphore::new(1024));
@@ -475,7 +476,7 @@ async fn test_all_backends_down_clean_failure() {
 
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", g2_port)).await.unwrap();
     client2.write_all(b"ping").await.unwrap();
-    let n = client2.read(&mut buf).await.unwrap();
+    let _n = client2.read(&mut buf).await.unwrap();
 }
 
 use traffic_gateway::config::HealthCheckConfig;
@@ -487,7 +488,7 @@ async fn spawn_gateway_with_health_checks(
     timeout_ms: u64,
     healthy_threshold: u32,
     unhealthy_threshold: u32,
-) -> (u16, CancellationToken, Arc<BackendPool>) {
+) -> (u16, CancellationToken, Arc<ArcSwap<BackendPool>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listen_port = listener.local_addr().unwrap().port();
 
@@ -496,11 +497,11 @@ async fn spawn_gateway_with_health_checks(
         .map(|p| Arc::new(BackendInstance::new(format!("127.0.0.1:{}", p).parse().unwrap(), "test_pool".into())))
         .collect();
 
-    let pool = Arc::new(BackendPool::new(
+    let pool = Arc::new(ArcSwap::from_pointee(BackendPool::new(
         format!("health-test-{}", listen_port),
         instances,
         LbStrategy::RoundRobin,
-    ));
+    )));
 
     let metrics = Arc::new(Metrics::new());
     let semaphore = Arc::new(Semaphore::new(1024));
@@ -535,7 +536,8 @@ async fn test_active_healthcheck_marks_down_without_traffic() {
     let (_g_port, _g, pool) = spawn_gateway_with_health_checks(&[dead_port], 100, 50, 2, 2).await;
     
     // Instance should start healthy
-    let instance = &pool.instances()[0];
+    let current_pool = pool.load();
+    let instance = &current_pool.instances()[0];
     assert!(instance.is_healthy(), "Instance should start healthy");
     
     // Wait enough time for 2 failures: (100ms interval + 50ms timeout) * 3 = 450ms wait
@@ -555,7 +557,8 @@ async fn test_recovery_readds_backend() {
     
     // 2. Start gateway pointing to this dead port
     let (g_port, _g, pool) = spawn_gateway_with_health_checks(&[dead_port], 100, 50, 2, 2).await;
-    let instance = &pool.instances()[0];
+    let current_pool = pool.load();
+    let instance = &current_pool.instances()[0];
     
     // Wait for health check to mark it DOWN
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -710,14 +713,15 @@ async fn test_kill_and_revive_during_load() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     // 1. Verify all 3 are healthy
-    assert_eq!(pool.healthy_count(), 3, "All backends should start healthy");
+    assert_eq!(pool.load().healthy_count(), 3, "All backends should start healthy");
 
     // 2. Kill backend B
     b2_cancel.cancel();
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     
-    assert_eq!(pool.healthy_count(), 2, "Killed backend should be marked unhealthy");
-    let b2_instance = &pool.instances()[1];
+    assert_eq!(pool.load().healthy_count(), 2, "Killed backend should be marked unhealthy");
+    let current_pool = pool.load();
+    let b2_instance = &current_pool.instances()[1];
     assert!(!b2_instance.is_healthy(), "Backend B should be DOWN");
 
     // 3. Send traffic while B is down — should succeed via A and C
@@ -765,7 +769,7 @@ async fn test_kill_and_revive_during_load() {
     // 5. Wait for health checks to mark B healthy again
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     assert!(b2_instance.is_healthy(), "Backend B should have recovered");
-    assert_eq!(pool.healthy_count(), 3, "All 3 backends should be healthy again");
+    assert_eq!(pool.load().healthy_count(), 3, "All 3 backends should be healthy again");
 
     // 6. Verify B is back in rotation
     let mut saw_b = false;
