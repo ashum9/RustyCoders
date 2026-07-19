@@ -2,6 +2,7 @@ use crate::backend::pool::BackendPool;
 use crate::backend::instance::ConnectionGuard;
 use crate::metrics::Metrics;
 use crate::proxy::connection::Connection;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -11,7 +12,7 @@ use tracing::{error, info, warn};
 
 pub async fn run_server(
     listen_addr: &str,
-    pool: Arc<BackendPool>,
+    pool: Arc<ArcSwap<BackendPool>>,
     connect_timeout_ms: u64,
     healthy_threshold: u32,
     unhealthy_threshold: u32,
@@ -23,13 +24,14 @@ pub async fn run_server(
     socket.set_reuseaddr(true)?;
     socket.bind(listen_addr.parse()?)?;
     let listener = socket.listen(1024)?;
-    info!("[{}] listening on {} with {} backends", pool.name(), listen_addr, pool.instances().len());
+    let current_pool = pool.load();
+    info!("[{}] listening on {} with {} backends", current_pool.name(), listen_addr, current_pool.instances().len());
     run_listener(listener, pool, connect_timeout_ms, healthy_threshold, unhealthy_threshold, metrics, semaphore, cancel_token).await
 }
 
 pub async fn run_listener(
     listener: TcpListener,
-    pool: Arc<BackendPool>,
+    pool: Arc<ArcSwap<BackendPool>>,
     connect_timeout_ms: u64,
     healthy_threshold: u32,
     unhealthy_threshold: u32,
@@ -40,7 +42,7 @@ pub async fn run_listener(
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                info!("[{}] listener shutting down", pool.name());
+                info!("[{}] listener shutting down", pool.load().name());
                 break;
             }
             accept_result = listener.accept() => {
@@ -49,28 +51,30 @@ pub async fn run_listener(
                         let permit = match semaphore.clone().acquire_owned().await {
                             Ok(p) => p,
                             Err(_) => {
-                                info!("[{}] semaphore closed, shutting down", pool.name());
+                                info!("[{}] semaphore closed, shutting down", pool.load().name());
                                 break;
                             }
                         };
 
                         let metrics_clone = metrics.clone();
                         let pool_clone = pool.clone();
-                        let listener_name = pool.name().to_string();
 
                         tokio::spawn(async move {
                             let _permit = permit;
                             let timeout_duration = Duration::from_millis(connect_timeout_ms);
-                            let max_retries = pool_clone.instances().len();
+                            // Load the current pool snapshot for this connection
+                            let current_pool = pool_clone.load();
+                            let listener_name = current_pool.name().to_string();
+                            let max_retries = current_pool.instances().len();
                             let mut tried = std::collections::HashSet::new();
 
                             // --- Retry Loop: try different backends until one succeeds ---
                             for attempt in 0..max_retries {
-                                let instance = match pool_clone.select() {
+                                let instance = match current_pool.select() {
                                     Some(inst) => inst,
                                     None => {
                                         // No healthy backends left at all
-                                        error!("[{}] no healthy backends available", pool_clone.name());
+                                        error!("[{}] no healthy backends available", listener_name);
                                         metrics_clone.inc_error();
                                         return;
                                     }
@@ -112,7 +116,7 @@ pub async fn run_listener(
                                         instance.record_failure(unhealthy_threshold);
                                         warn!(
                                             "[{}] failover: {} failed (attempt {}/{}): {}, trying next backend",
-                                            pool_clone.name(), instance.address(), attempt + 1, max_retries, e
+                                            listener_name, instance.address(), attempt + 1, max_retries, e
                                         );
                                         // guard is dropped here automatically (RAII), decrementing active count
                                     }
@@ -121,7 +125,7 @@ pub async fn run_listener(
                                         instance.record_failure(unhealthy_threshold);
                                         warn!(
                                             "[{}] failover: {} timed out (attempt {}/{}), trying next backend",
-                                            pool_clone.name(), instance.address(), attempt + 1, max_retries
+                                            listener_name, instance.address(), attempt + 1, max_retries
                                         );
                                         // guard is dropped here automatically (RAII)
                                     }
@@ -131,7 +135,7 @@ pub async fn run_listener(
                             // All retries exhausted — no backend could serve this client
                             error!(
                                 "[{}] all {} backends failed for client {}, dropping connection",
-                                pool_clone.name(), max_retries, client_addr
+                                listener_name, max_retries, client_addr
                             );
                             metrics_clone.inc_error();
                         });
