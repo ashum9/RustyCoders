@@ -1,21 +1,16 @@
 [global]
-max_connections = 1024
+max_connections = 1000
 
 [[listeners]]
 name = "service-a"
-listen = "127.0.0.1:8081"
-backends = [
-    "127.0.0.1:9001",
-    "127.0.0.1:9002",
-    "127.0.0.1:9003"
-]
+listen = "127.0.0.1:8080"
+backends = ["127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9003"]
 strategy = "round_robin"
+connect_timeout_ms = 1000
 
-[[listeners]]
-name = "service-b"
-listen = "127.0.0.1:8082"
-backends = [
-    "127.0.0.1:9010",
-    "127.0.0.1:9011"
-]
-strategy = "least_connections"
+[listeners.health_check]
+enabled = true
+interval_ms = 2000
+timeout_ms = 500
+healthy_threshold = 2
+unhealthy_threshold = 3
