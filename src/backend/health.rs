@@ -1,5 +1,6 @@
 use crate::backend::pool::BackendPool;
 use crate::config::HealthCheckConfig;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -7,12 +8,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, debug};
 
 pub fn start_health_check_task(
-    pool: Arc<BackendPool>,
+    pool: Arc<ArcSwap<BackendPool>>,
     config: HealthCheckConfig,
     cancel_token: CancellationToken,
 ) {
     if !config.enabled {
-        info!("[{}] health checks disabled", pool.name());
+        info!("[{}] health checks disabled", pool.load().name());
         return;
     }
 
@@ -23,7 +24,7 @@ pub fn start_health_check_task(
 
     info!(
         "[{}] starting active health checks: interval={}ms, timeout={}ms",
-        pool.name(), interval_ms, timeout_ms
+        pool.load().name(), interval_ms, timeout_ms
     );
 
     tokio::spawn(async move {
@@ -38,8 +39,11 @@ pub fn start_health_check_task(
                 _ = interval.tick() => {
                     let mut probe_handles = Vec::new();
                     
+                    // Load current pool snapshot so we probe the latest backends
+                    let current_pool = pool.load();
+                    
                     // Concurrently probe all instances so one slow backend doesn't delay others
-                    for instance in pool.instances() {
+                    for instance in current_pool.instances() {
                         let instance_clone = instance.clone();
                         let timeout_duration = Duration::from_millis(timeout_ms);
                         
@@ -73,7 +77,7 @@ pub fn start_health_check_task(
                     }
                 }
                 _ = cancel_token.cancelled() => {
-                    info!("[{}] health check task shutting down", pool.name());
+                    info!("[{}] health check task shutting down", pool.load().name());
                     break;
                 }
             }

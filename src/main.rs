@@ -2,7 +2,10 @@ use traffic_gateway::backend::instance::BackendInstance;
 use traffic_gateway::backend::pool::{BackendPool, LbStrategy};
 use traffic_gateway::config::GatewayConfig;
 use traffic_gateway::metrics::Metrics;
+use traffic_gateway::reload;
 
+use arc_swap::ArcSwap;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +38,12 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let mut all_pools = Vec::new();
+    // Pools map for hot-reload: listener_name -> Arc<ArcSwap<BackendPool>>
+    let mut pools_map: HashMap<String, Arc<ArcSwap<BackendPool>>> = HashMap::new();
+    // Health check cancel tokens for restart on reload
+    let mut health_tokens: HashMap<String, CancellationToken> = HashMap::new();
+    let mut all_pools: Vec<Arc<ArcSwap<BackendPool>>> = Vec::new();
+
     for listener in config.listeners {
         tracing::info!("  - [{}]: {} -> {:?}", listener.name, listener.listen, listener.backends);
 
@@ -47,7 +55,8 @@ async fn main() -> anyhow::Result<()> {
         }
         
         let strategy = LbStrategy::from_str(&listener.strategy).unwrap_or(LbStrategy::RoundRobin);
-        let pool = Arc::new(BackendPool::new(listener.name.clone(), instances, strategy));
+        let pool = Arc::new(ArcSwap::from_pointee(BackendPool::new(listener.name.clone(), instances, strategy)));
+        pools_map.insert(listener.name.clone(), pool.clone());
         all_pools.push(pool.clone());
         let connect_timeout_ms = listener.connect_timeout_ms;
         let listen_addr = listener.listen.clone();
@@ -57,12 +66,13 @@ async fn main() -> anyhow::Result<()> {
         let metrics_clone = metrics.clone();
         let semaphore_clone = semaphore.clone();
         let cancel_token_clone = cancel_token.clone();
-        let cancel_token_health = cancel_token.clone();
+        let cancel_token_health = cancel_token.child_token();
 
         let healthy_threshold = listener.health_check.healthy_threshold;
         let unhealthy_threshold = listener.health_check.unhealthy_threshold;
 
         if health_config.enabled {
+            health_tokens.insert(listener.name.clone(), cancel_token_health.clone());
             traffic_gateway::backend::health::start_health_check_task(pool.clone(), health_config, cancel_token_health);
         }
 
@@ -83,6 +93,32 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+    // SIGHUP handler for config hot-reload
+    let pools_for_reload = pools_map.clone();
+    let health_tokens_reload = Arc::new(tokio::sync::Mutex::new(health_tokens));
+    let cancel_token_for_reload = cancel_token.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sig = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("failed to register SIGHUP handler: {}", e);
+                return;
+            }
+        };
+        loop {
+            sig.recv().await;
+            tracing::info!("SIGHUP received — reloading config...");
+            let mut tokens = health_tokens_reload.lock().await;
+            reload::reload_config(
+                config_path,
+                &pools_for_reload,
+                &mut tokens,
+                &cancel_token_for_reload,
+            );
+        }
+    });
 
     let metrics_clone = metrics.clone();
     tokio::spawn(async move {
@@ -113,7 +149,8 @@ async fn main() -> anyhow::Result<()> {
             );
 
             for pool in &all_pools {
-                let instances = pool.instances();
+                let current_pool = pool.load();
+                let instances = current_pool.instances();
                 let total_inst = instances.len();
                 let healthy_inst = instances.iter().filter(|i| i.is_healthy()).count();
                 
@@ -129,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
                 
                 tracing::info!(
                     "pool[{}]: {}/{} healthy |{}",
-                    pool.name(), healthy_inst, total_inst, inst_status
+                    current_pool.name(), healthy_inst, total_inst, inst_status
                 );
             }
         }
