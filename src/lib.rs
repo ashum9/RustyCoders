@@ -4,3 +4,4 @@ pub mod metrics;
 pub mod proxy;
 pub mod backend;
 pub mod reload;
+pub mod admin;

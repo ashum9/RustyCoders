@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Traffic Gateway</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: #f7f7f8;
+    color: #1a1a1a;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+
+  /* ── Header ────────────────────────────────────── */
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 24px;
+    background: #ffffff;
+    border-bottom: 1px solid #e5e7eb;
+  }
+  .header-title {
+    font-weight: 700;
+    font-size: 15px;
+    letter-spacing: 0.02em;
+  }
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 13px;
+    color: #6b7280;
+  }
+  .header-right .uptime {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+  }
+  .status-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    margin-right: 5px;
+    vertical-align: middle;
+  }
+  .status-connected { background: #2e7d32; }
+  .status-disconnected { background: #c62828; }
+
+  /* ── Metrics Row ───────────────────────────────── */
+  .metrics-row {
+    display: flex;
+    background: #ffffff;
+    border-bottom: 1px solid #e5e7eb;
+    padding: 0;
+  }
+  .metric-block {
+    flex: 1;
+    padding: 14px 20px;
+    border-right: 1px solid #e5e7eb;
+    min-width: 0;
+  }
+  .metric-block:last-child { border-right: none; }
+  .metric-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #6b7280;
+    margin-bottom: 2px;
+  }
+  .metric-value {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 26px;
+    font-weight: 700;
+    color: #1a1a1a;
+    line-height: 1.2;
+  }
+
+  /* ── Pool Sections ─────────────────────────────── */
+  .content { padding: 16px 24px; }
+  .pool-section {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 2px;
+    margin-bottom: 12px;
+  }
+  .pool-header {
+    padding: 10px 16px;
+    border-bottom: 1px solid #e5e7eb;
+    font-size: 13px;
+    color: #6b7280;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+  }
+  .pool-header strong {
+    color: #1a1a1a;
+    font-weight: 700;
+  }
+
+  /* ── Backend Table ─────────────────────────────── */
+  .backend-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .backend-table th {
+    text-align: left;
+    padding: 8px 16px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #6b7280;
+    border-bottom: 1px solid #e5e7eb;
+    background: #fafafa;
+  }
+  .backend-table td {
+    padding: 7px 16px;
+    border-bottom: 1px solid #f0f0f0;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+  }
+  .backend-table tr:last-child td { border-bottom: none; }
+  .backend-table tr.row-down { background: #fdecea; }
+
+  .status-healthy { color: #2e7d32; font-weight: 600; }
+  .status-down { color: #c62828; font-weight: 600; }
+
+  /* ── Footer ────────────────────────────────────── */
+  .footer {
+    padding: 12px 24px;
+    font-size: 11px;
+    color: #9ca3af;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-title">Traffic Gateway</div>
+  <div class="header-right">
+    <span>Uptime: <span class="uptime" id="uptime">--:--:--</span></span>
+    <span id="conn-status"><span class="status-dot status-connected"></span>Connected</span>
+  </div>
+</div>
+
+<!-- Key Metrics Row -->
+<div class="metrics-row">
+  <div class="metric-block">
+    <div class="metric-label">Active Connections</div>
+    <div class="metric-value" id="m-active">0</div>
+  </div>
+  <div class="metric-block">
+    <div class="metric-label">Total Connections</div>
+    <div class="metric-value" id="m-total">0</div>
+  </div>
+  <div class="metric-block">
+    <div class="metric-label">Req / Sec</div>
+    <div class="metric-value" id="m-cps">0</div>
+  </div>
+  <div class="metric-block">
+    <div class="metric-label">Throughput</div>
+    <div class="metric-value" id="m-throughput">0 B/s</div>
+  </div>
+  <div class="metric-block">
+    <div class="metric-label">Errors</div>
+    <div class="metric-value" id="m-errors">0</div>
+  </div>
+  <div class="metric-block">
+    <div class="metric-label">Peak Connections</div>
+    <div class="metric-value" id="m-peak">0</div>
+  </div>
+</div>
+
+<!-- Pool Sections -->
+<div class="content" id="pools-container">
+  <div style="padding: 20px; color: #6b7280;">Loading...</div>
+</div>
+
+<!-- Footer -->
+<div class="footer" id="footer">
+  Auto-refreshing every 1s
+</div>
+
+<script>
+function formatNumber(n) {
+  return Number(n).toLocaleString('en-US');
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B/s';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB/s';
+  if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB/s';
+  return (bytes / 1073741824).toFixed(2) + ' GB/s';
+}
+
+function formatUptime(seconds) {
+  var h = Math.floor(seconds / 3600);
+  var m = Math.floor((seconds % 3600) / 60);
+  var s = seconds % 60;
+  return String(h).padStart(2, '0') + ':' +
+         String(m).padStart(2, '0') + ':' +
+         String(s).padStart(2, '0');
+}
+
+function setConnected(ok) {
+  var el = document.getElementById('conn-status');
+  if (ok) {
+    el.innerHTML = '<span class="status-dot status-connected"></span>Connected';
+  } else {
+    el.innerHTML = '<span class="status-dot status-disconnected"></span>Disconnected';
+  }
+}
+
+function renderPools(pools) {
+  var container = document.getElementById('pools-container');
+  var html = '';
+  for (var i = 0; i < pools.length; i++) {
+    var p = pools[i];
+    html += '<div class="pool-section">';
+    html += '<div class="pool-header">';
+    html += 'Pool: <strong>' + p.name + '</strong>';
+    html += ' &nbsp;|&nbsp; Listen: ' + p.listen;
+    html += ' &nbsp;|&nbsp; Strategy: ' + p.strategy;
+    html += ' &nbsp;|&nbsp; Healthy: ' + p.healthy_count + ' / ' + p.total_count;
+    html += '</div>';
+    html += '<table class="backend-table">';
+    html += '<thead><tr><th>Backend Address</th><th>Status</th><th>Active Conns</th><th>Total Served</th></tr></thead>';
+    html += '<tbody>';
+    for (var j = 0; j < p.backends.length; j++) {
+      var b = p.backends[j];
+      var isDown = b.status === 'down';
+      html += '<tr class="' + (isDown ? 'row-down' : '') + '">';
+      html += '<td>' + b.address + '</td>';
+      html += '<td class="' + (isDown ? 'status-down' : 'status-healthy') + '">';
+      html += isDown ? 'Down' : 'Healthy';
+      html += '</td>';
+      html += '<td>' + formatNumber(b.active_connections) + '</td>';
+      html += '<td>' + formatNumber(b.total_served) + '</td>';
+      html += '</tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+  container.innerHTML = html;
+}
+
+function update() {
+  fetch('/api/stats')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      setConnected(true);
+      document.getElementById('uptime').textContent = formatUptime(d.uptime_seconds);
+      document.getElementById('m-active').textContent = formatNumber(d.active_connections);
+      document.getElementById('m-total').textContent = formatNumber(d.total_connections);
+      document.getElementById('m-cps').textContent = formatNumber(d.connections_per_second);
+      document.getElementById('m-throughput').textContent = formatBytes(d.throughput_rx_per_sec + d.throughput_tx_per_sec);
+      document.getElementById('m-errors').textContent = formatNumber(d.total_errors);
+      document.getElementById('m-peak').textContent = formatNumber(d.peak_connections);
+      renderPools(d.pools);
+      var now = new Date();
+      var ts = String(now.getHours()).padStart(2,'0') + ':' +
+               String(now.getMinutes()).padStart(2,'0') + ':' +
+               String(now.getSeconds()).padStart(2,'0');
+      document.getElementById('footer').textContent = 'Auto-refreshing every 1s \u00b7 Last updated: ' + ts;
+    })
+    .catch(function() {
+      setConnected(false);
+    });
+}
+
+update();
+setInterval(update, 1000);
+</script>
+
+</body>
+</html>

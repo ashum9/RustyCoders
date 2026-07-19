@@ -50,6 +50,13 @@ impl BackendPool {
         self.instances.iter().filter(|i| i.is_healthy()).count()
     }
 
+    pub fn strategy_name(&self) -> &str {
+        match self.strategy {
+            LbStrategy::RoundRobin => "round_robin",
+            LbStrategy::LeastConnections => "least_connections",
+        }
+    }
+
     pub fn select(&self) -> Option<Arc<BackendInstance>> {
         match self.strategy {
             LbStrategy::RoundRobin => self.select_round_robin(),

@@ -13,6 +13,8 @@ pub struct GatewayConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct GlobalConfig {
     pub max_connections: usize,
+    #[serde(default = "default_admin_listen")]
+    pub admin_listen: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -45,6 +47,7 @@ pub struct HealthCheckConfig {
 
 fn default_strategy() -> String { "round_robin".to_string() }
 fn default_connect_timeout() -> u64 { 1000 }
+fn default_admin_listen() -> String { "127.0.0.1:9090".to_string() }
 fn default_hc_enabled() -> bool { true }
 fn default_hc_interval() -> u64 { 2000 }
 fn default_hc_timeout() -> u64 { 500 }

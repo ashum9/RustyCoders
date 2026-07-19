@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("gateway starting...");
+    let start_time = std::time::Instant::now();
 
     let config_path = "gateway.toml";
     let config = GatewayConfig::load(config_path)?;
@@ -40,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Pools map for hot-reload: listener_name -> Arc<ArcSwap<BackendPool>>
     let mut pools_map: HashMap<String, Arc<ArcSwap<BackendPool>>> = HashMap::new();
+    let mut listener_addrs: HashMap<String, String> = HashMap::new();
     // Health check cancel tokens for restart on reload
     let mut health_tokens: HashMap<String, CancellationToken> = HashMap::new();
     let mut all_pools: Vec<Arc<ArcSwap<BackendPool>>> = Vec::new();
@@ -57,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         let strategy = LbStrategy::from_str(&listener.strategy).unwrap_or(LbStrategy::RoundRobin);
         let pool = Arc::new(ArcSwap::from_pointee(BackendPool::new(listener.name.clone(), instances, strategy)));
         pools_map.insert(listener.name.clone(), pool.clone());
+        listener_addrs.insert(listener.name.clone(), listener.listen.clone());
         all_pools.push(pool.clone());
         let connect_timeout_ms = listener.connect_timeout_ms;
         let listen_addr = listener.listen.clone();
@@ -93,6 +96,16 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+    // Admin dashboard server
+    traffic_gateway::admin::start_admin_server(
+        config.global.admin_listen.clone(),
+        metrics.clone(),
+        pools_map.clone(),
+        listener_addrs,
+        start_time,
+        cancel_token.clone(),
+    );
 
     // SIGHUP handler for config hot-reload
     let pools_for_reload = pools_map.clone();
