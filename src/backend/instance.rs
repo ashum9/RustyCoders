@@ -5,6 +5,7 @@ use tracing::{info, warn};
 
 pub struct BackendInstance {
     address: SocketAddr,
+    pool_name: String,
     healthy: AtomicBool,
     active_connections: AtomicU64,
     consecutive_failures: AtomicU32,
@@ -13,9 +14,10 @@ pub struct BackendInstance {
 }
 
 impl BackendInstance {
-    pub fn new(address: SocketAddr) -> Self {
+    pub fn new(address: SocketAddr, pool_name: String) -> Self {
         Self {
             address,
+            pool_name,
             healthy: AtomicBool::new(true),
             active_connections: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
@@ -42,12 +44,13 @@ impl BackendInstance {
 
     pub fn mark_healthy(&self) {
         self.healthy.store(true, Ordering::SeqCst);
-        info!("backend {} RECOVERED — marked HEALTHY", self.address);
+        info!("backend {} in pool {} RECOVERED — marked HEALTHY", self.address, self.pool_name);
     }
 
     pub fn mark_unhealthy(&self) {
+        let failures = self.consecutive_failures.load(Ordering::Relaxed);
         self.healthy.store(false, Ordering::SeqCst);
-        warn!("backend {} marked UNHEALTHY", self.address);
+        warn!("backend {} in pool {} marked UNHEALTHY after {} consecutive failures", self.address, self.pool_name, failures);
     }
 
     pub fn record_failure(&self, unhealthy_threshold: u32) {
@@ -109,7 +112,7 @@ mod tests {
 
     #[test]
     fn test_instance_starts_healthy() {
-        let instance = BackendInstance::new(dummy_addr());
+        let instance = BackendInstance::new(dummy_addr(), "test_pool".into());
         assert!(instance.is_healthy());
         assert_eq!(instance.active_connections(), 0);
         assert_eq!(instance.total_served(), 0);
@@ -117,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_mark_unhealthy_and_healthy() {
-        let instance = BackendInstance::new(dummy_addr());
+        let instance = BackendInstance::new(dummy_addr(), "test_pool".into());
         
         instance.mark_unhealthy();
         assert!(!instance.is_healthy());
@@ -128,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_record_failure_triggers_unhealthy() {
-        let instance = BackendInstance::new(dummy_addr());
+        let instance = BackendInstance::new(dummy_addr(), "test_pool".into());
         
         instance.record_failure(3);
         assert!(instance.is_healthy()); // 1 failure
@@ -142,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_record_failure_below_threshold_stays_healthy() {
-        let instance = BackendInstance::new(dummy_addr());
+        let instance = BackendInstance::new(dummy_addr(), "test_pool".into());
         instance.record_failure(3);
         instance.record_failure(3);
         assert!(instance.is_healthy());
@@ -150,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_record_success_triggers_recovery() {
-        let instance = BackendInstance::new(dummy_addr());
+        let instance = BackendInstance::new(dummy_addr(), "test_pool".into());
         instance.mark_unhealthy();
         
         instance.record_success(2);
@@ -162,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_record_success_resets_failure_count() {
-        let instance = BackendInstance::new(dummy_addr());
+        let instance = BackendInstance::new(dummy_addr(), "test_pool".into());
         
         instance.record_failure(5);
         instance.record_failure(5);
@@ -181,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_connection_guard_increments_and_decrements() {
-        let instance = Arc::new(BackendInstance::new(dummy_addr()));
+        let instance = Arc::new(BackendInstance::new(dummy_addr(), "test_pool".into()));
         assert_eq!(instance.active_connections(), 0);
         assert_eq!(instance.total_served(), 0);
         
@@ -197,7 +200,7 @@ mod tests {
 
     #[test]
     fn test_connection_guard_multiple() {
-        let instance = Arc::new(BackendInstance::new(dummy_addr()));
+        let instance = Arc::new(BackendInstance::new(dummy_addr(), "test_pool".into()));
         
         let guard1 = ConnectionGuard::new(instance.clone());
         let guard2 = ConnectionGuard::new(instance.clone());

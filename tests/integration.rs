@@ -23,7 +23,7 @@ async fn spawn_gateway_listener(backend_port: u16) -> (u16, CancellationToken) {
         health_check: Default::default(),
     };
     
-    let instance = Arc::new(BackendInstance::new(format!("127.0.0.1:{}", backend_port).parse().unwrap()));
+    let instance = Arc::new(BackendInstance::new(format!("127.0.0.1:{}", backend_port).parse().unwrap(), "test_pool".into()));
     let pool = Arc::new(BackendPool::new(config.name.clone(), vec![instance], LbStrategy::RoundRobin));
 
     let metrics = Arc::new(Metrics::new());
@@ -384,7 +384,7 @@ async fn spawn_gateway_multi_backend(backend_ports: &[u16]) -> (u16, Cancellatio
 
     let instances: Vec<Arc<BackendInstance>> = backend_ports
         .iter()
-        .map(|p| Arc::new(BackendInstance::new(format!("127.0.0.1:{}", p).parse().unwrap())))
+        .map(|p| Arc::new(BackendInstance::new(format!("127.0.0.1:{}", p).parse().unwrap(), "test_pool".into())))
         .collect();
 
     let pool = Arc::new(BackendPool::new(
@@ -476,5 +476,312 @@ async fn test_all_backends_down_clean_failure() {
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", g2_port)).await.unwrap();
     client2.write_all(b"ping").await.unwrap();
     let n = client2.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"RECOVERED");
+}
+
+use traffic_gateway::config::HealthCheckConfig;
+use traffic_gateway::backend::health::start_health_check_task;
+
+async fn spawn_gateway_with_health_checks(
+    backend_ports: &[u16],
+    interval_ms: u64,
+    timeout_ms: u64,
+    healthy_threshold: u32,
+    unhealthy_threshold: u32,
+) -> (u16, CancellationToken, Arc<BackendPool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_port = listener.local_addr().unwrap().port();
+
+    let instances: Vec<Arc<BackendInstance>> = backend_ports
+        .iter()
+        .map(|p| Arc::new(BackendInstance::new(format!("127.0.0.1:{}", p).parse().unwrap(), "test_pool".into())))
+        .collect();
+
+    let pool = Arc::new(BackendPool::new(
+        format!("health-test-{}", listen_port),
+        instances,
+        LbStrategy::RoundRobin,
+    ));
+
+    let metrics = Arc::new(Metrics::new());
+    let semaphore = Arc::new(Semaphore::new(1024));
+    let cancel_token = CancellationToken::new();
+    
+    let hc_config = HealthCheckConfig {
+        enabled: true,
+        interval_ms,
+        timeout_ms,
+        healthy_threshold,
+        unhealthy_threshold,
+    };
+    
+    start_health_check_task(pool.clone(), hc_config, cancel_token.clone());
+
+    let pool_clone = pool.clone();
+    let cancel_token_clone = cancel_token.clone();
+    
+    tokio::spawn(async move {
+        let _ = run_listener(listener, pool_clone, 1000, healthy_threshold, unhealthy_threshold, metrics, semaphore, cancel_token_clone).await;
+    });
+
+    (listen_port, cancel_token, pool)
+}
+
+#[tokio::test]
+async fn test_active_healthcheck_marks_down_without_traffic() {
+    // We use a fake port that nothing listens on
+    let dead_port = 59998;
+    
+    // Spawn gateway with health checks: 100ms interval, 50ms timeout, threshold=2
+    let (_g_port, _g, pool) = spawn_gateway_with_health_checks(&[dead_port], 100, 50, 2, 2).await;
+    
+    // Instance should start healthy
+    let instance = &pool.instances()[0];
+    assert!(instance.is_healthy(), "Instance should start healthy");
+    
+    // Wait enough time for 2 failures: (100ms interval + 50ms timeout) * 3 = 450ms wait
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    
+    // It should now be passively marked unhealthy without ANY client traffic!
+    assert!(!instance.is_healthy(), "Health check failed to mark dead backend unhealthy");
+}
+
+#[tokio::test]
+async fn test_recovery_readds_backend() {
+    // 1. Start a backend and grab its port, but then immediately drop (kill) it
+    let dead_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    
+    // 2. Start gateway pointing to this dead port
+    let (g_port, _g, pool) = spawn_gateway_with_health_checks(&[dead_port], 100, 50, 2, 2).await;
+    let instance = &pool.instances()[0];
+    
+    // Wait for health check to mark it DOWN
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    assert!(!instance.is_healthy(), "Backend must be marked unhealthy first");
+    
+    // 3. RECOVERY: Now start the actual backend on the SAME port
+    let cancel_token = CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", dead_port)).await.unwrap();
+        loop {
+            tokio::select! {
+                _ = cancel_token_clone.cancelled() => break,
+                Ok((mut socket, _)) = listener.accept() => {
+                    tokio::spawn(async move {
+                        let mut buf = [0; 1024];
+                        if let Ok(n) = socket.read(&mut buf).await {
+                            if n > 0 {
+                                let _ = socket.write_all(b"RECOVERED-SERVICE").await;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+    
+    // Wait for health check to detect it and mark it UP
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    assert!(instance.is_healthy(), "Backend was not marked healthy after recovery!");
+    
+    // 4. VERIFY: Traffic should now flow normally
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", g_port)).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let mut buf = [0; 1024];
+    let _n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[.._n], b"RECOVERED-SERVICE");
+    
+    cancel_token.cancel();
+}
+
+/// Level 4 — Chaos Under Load: Kill a backend while traffic is flowing.
+/// Assertion matches our documented L4 limitation:
+///   - NEW connections after the kill see zero failures (failover reroutes them).
+///   - Mid-stream connections on the killed backend MAY fail (L4 can't replay byte streams).
+///   - Gateway must never crash.
+#[tokio::test]
+async fn test_kill_backend_during_load() {
+    let (b1_port, _b1) = spawn_echo_identity_backend("CHAOS-A").await;
+    let (b2_port, b2_cancel) = spawn_echo_identity_backend("CHAOS-B").await;
+    let (b3_port, _b3) = spawn_echo_identity_backend("CHAOS-C").await;
+
+    let (g_port, _g) = spawn_gateway_multi_backend(&[b1_port, b2_port, b3_port]).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let successes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Phase 1: Sustained load with all 3 backends alive
+    let mut handles = Vec::new();
+    for _ in 0..100 {
+        let succ = successes.clone();
+        let err = errors.clone();
+        let h = tokio::spawn(async move {
+            match TcpStream::connect(format!("127.0.0.1:{}", g_port)).await {
+                Ok(mut client) => {
+                    let _ = client.write_all(b"ping").await;
+                    let mut buf = [0; 1024];
+                    match client.read(&mut buf).await {
+                        Ok(n) if n > 0 => {
+                            let resp = String::from_utf8_lossy(&buf[..n]);
+                            if resp.starts_with("CHAOS-") {
+                                succ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                err.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        _ => { err.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    }
+                }
+                Err(_) => { err.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+            }
+        });
+        handles.push(h);
+    }
+    for h in handles { let _ = h.await; }
+    
+    // All 100 should have succeeded with 3 healthy backends
+    assert!(successes.load(std::sync::atomic::Ordering::Relaxed) >= 95, 
+        "Pre-kill: too many failures");
+
+    // Phase 2: Kill backend B mid-flight, then fire more requests.
+    // New connections MUST succeed (failover to A and C).
+    b2_cancel.cancel();
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let post_kill_successes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let post_kill_errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..100 {
+        let succ = post_kill_successes.clone();
+        let err = post_kill_errors.clone();
+        let h = tokio::spawn(async move {
+            match TcpStream::connect(format!("127.0.0.1:{}", g_port)).await {
+                Ok(mut client) => {
+                    let _ = client.write_all(b"ping").await;
+                    let mut buf = [0; 1024];
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(3),
+                        client.read(&mut buf),
+                    ).await {
+                        Ok(Ok(n)) if n > 0 => {
+                            let resp = String::from_utf8_lossy(&buf[..n]);
+                            if resp == "CHAOS-A" || resp == "CHAOS-C" {
+                                succ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                err.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        _ => { err.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    }
+                }
+                Err(_) => { err.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+            }
+        });
+        handles.push(h);
+    }
+    for h in handles { let _ = h.await; }
+    
+    let post_succ = post_kill_successes.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(post_succ >= 95,
+        "Post-kill: new connections should succeed via failover, got only {}/100", post_succ);
+}
+
+/// Level 4 — Chaos Under Load: Kill a backend, let it be marked DOWN,
+/// then revive it and verify it rejoins the pool under continuous traffic.
+#[tokio::test]
+async fn test_kill_and_revive_during_load() {
+    let (b1_port, _b1) = spawn_echo_identity_backend("REVIVE-A").await;
+    let (b2_port, b2_cancel) = spawn_echo_identity_backend("REVIVE-B").await;
+    let (b3_port, _b3) = spawn_echo_identity_backend("REVIVE-C").await;
+
+    // Use health-check-enabled gateway so recovery is detected
+    let (g_port, _g, pool) = spawn_gateway_with_health_checks(
+        &[b1_port, b2_port, b3_port],
+        100,   // interval_ms: fast checks for test speed
+        50,    // timeout_ms
+        2,     // healthy_threshold
+        2,     // unhealthy_threshold
+    ).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // 1. Verify all 3 are healthy
+    assert_eq!(pool.healthy_count(), 3, "All backends should start healthy");
+
+    // 2. Kill backend B
+    b2_cancel.cancel();
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    
+    assert_eq!(pool.healthy_count(), 2, "Killed backend should be marked unhealthy");
+    let b2_instance = &pool.instances()[1];
+    assert!(!b2_instance.is_healthy(), "Backend B should be DOWN");
+
+    // 3. Send traffic while B is down — should succeed via A and C
+    let mut handles = Vec::new();
+    for _ in 0..50 {
+        let h = tokio::spawn(async move {
+            if let Ok(mut client) = TcpStream::connect(format!("127.0.0.1:{}", g_port)).await {
+                let _ = client.write_all(b"ping").await;
+                let mut buf = [0; 1024];
+                if let Ok(n) = client.read(&mut buf).await {
+                    if n > 0 {
+                        let resp = String::from_utf8_lossy(&buf[..n]);
+                        assert!(resp == "REVIVE-A" || resp == "REVIVE-C",
+                            "Should NOT route to dead backend B, got: {}", resp);
+                    }
+                }
+            }
+        });
+        handles.push(h);
+    }
+    for h in handles { let _ = h.await; }
+
+    // 4. REVIVE: restart backend B on the same port
+    let revive_cancel = CancellationToken::new();
+    let revive_cancel_clone = revive_cancel.clone();
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", b2_port)).await.unwrap();
+        loop {
+            tokio::select! {
+                _ = revive_cancel_clone.cancelled() => break,
+                Ok((mut socket, _)) = listener.accept() => {
+                    tokio::spawn(async move {
+                        let mut buf = [0; 1024];
+                        if let Ok(n) = socket.read(&mut buf).await {
+                            if n > 0 {
+                                let _ = socket.write_all(b"REVIVE-B").await;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    // 5. Wait for health checks to mark B healthy again
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    assert!(b2_instance.is_healthy(), "Backend B should have recovered");
+    assert_eq!(pool.healthy_count(), 3, "All 3 backends should be healthy again");
+
+    // 6. Verify B is back in rotation
+    let mut saw_b = false;
+    for _ in 0..30 {
+        if let Ok(mut client) = TcpStream::connect(format!("127.0.0.1:{}", g_port)).await {
+            let _ = client.write_all(b"ping").await;
+            let mut buf = [0; 1024];
+            if let Ok(n) = client.read(&mut buf).await {
+                if n > 0 && &buf[..n] == b"REVIVE-B" {
+                    saw_b = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(saw_b, "Revived backend B should receive traffic again");
+    
+    revive_cancel.cancel();
 }

@@ -104,7 +104,7 @@ mod tests {
         (0..count)
             .map(|i| {
                 let addr = format!("127.0.0.1:{}", 8000 + i).parse::<SocketAddr>().unwrap();
-                Arc::new(BackendInstance::new(addr))
+                Arc::new(BackendInstance::new(addr, "test_pool".into()))
             })
             .collect()
     }
